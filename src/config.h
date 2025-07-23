@@ -7,7 +7,7 @@
 
 #define MAX_TARGETS 10
 #ifndef CONFIG_FILE
-#define CONFIG_FILE CONFIG_PREFIX "/" "wake-on-arp-alt.conf"
+#define CONFIG_FILE CONFIG_PREFIX "/wake-on-arp-alt.conf"
 #endif
 
 struct config {
