@@ -1,6 +1,6 @@
 #ifndef CONFIG_H
 #define CONFIG_H
-
+#include <stdbool.h>
 #include <netinet/in.h>
 #include <net/ethernet.h>
 #include <net/if.h>
