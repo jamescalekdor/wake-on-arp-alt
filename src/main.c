@@ -1,492 +1,168 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <errno.h>
-#include <netdb.h>
-#include <stdio.h>		// for standard things
-#include <stdlib.h>		// malloc
-#include <string.h>		// strlen
-#include <stdbool.h>
-
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <netinet/ip.h>				// provides declarations for ip header
-#include <netinet/if_ether.h>		// for ETH_P_ALL
-#include <net/ethernet.h>			// for ether_header
-#include <net/if.h>
-#include <sys/socket.h>
-#include <sys/ioctl.h>
-#include <sys/time.h>
-#include <sys/types.h>
 #include <unistd.h>
-#include <signal.h>
-#include <byteswap.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <net/if.h>
+#include <net/ethernet.h>
+#include <netpacket/packet.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
+#include "config.h"
 
-#include "ns_arp.h"
-#include "ns_arp_packet.h"
+#define POLL_INTERVAL 5  // seconds between poll cycles
+#define REPLY_TIMEOUT_US 500000  // 0.5 sec for ARP reply
 
-#include "array.h"
-#include "functions.h"
-
-#ifndef CONFIG_PREFIX
-	#error "Please specify CONFIG_PREFIX (usually /etc on Linux)"
-#endif
-
-// RETurn ON FAILure
-#define RETONFAIL(x) { int a = x; if(a) return a; }
-
-// FAILure ON ARGumentS
-#define FAILONARGS(i, max) { if(max==i+1) { \
-				fprintf(stderr, "Invalid number of arguments!\n"); \
-				return -1; } }
-
-const char *USAGE_INFO = \
-"This program is a daemon wakes up a device on the local\n"
-"network based upon if the local system tries to access it\n"
-"via LAN network.\n"
-"These parameters can also be set in the config file,\n"
-"which is located at "CONFIG_PREFIX"/wake-on-arp.conf\n"
-"Usage:\n"
-"\t-h/--help - this screen\n"
-"\t-i - IP address of device to wake up\n"
-"\t-m - MAC (hardware) address of device to wake up\n"
-"\t-d - network device to check traffic from (eg. eth0)\n"
-"\t-b - broadcast IP address (eg. 192.168.1.255)\n"
-"\t-s - subnet IP mask (eg. 24)\n"
-"\t-ag - send magic packet even if the ARP came from the router/gateway (disabled by default). "
-"For further info look here: https://github.com/nikp123/wake-on-arp/issues/1#issuecomment-882708765\n";
-
-void cleanup();
-void sig_handler();
-int initialize();
-int watch_packets();
-int process_packet(unsigned char*);
-int parse_arp(unsigned char *);
-int parse_ethhdr(unsigned char*);
-int get_local_ip();
-int send_magic_packet(unsigned char*);
-
-struct main {
-	char *eth_dev_s;
-	char *eth_ip_s;
-	char *broadcast_ip_s;
-	char *subnet_s;
-	char *allow_gateway_s;
-
-	struct target *target_list;
-
-	uint32_t *source_blacklist;
-
-	unsigned char eth_ip[4];
-	unsigned char gate_ip[4];
-
-	unsigned int  subnet;
-
-	unsigned char *buffer;
-	int sock_raw;
-	bool alive;
-} m;
-
-void cleanup() {
-	arr_free(m.source_blacklist);
-	targets_destroy(m.target_list);
-	close(m.sock_raw);
-	free(m.buffer);
+int get_interface_info(const char *dev, struct in_addr *ip, struct ether_addr *mac, int *ifindex) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return -1;
+    struct ifreq ifr;
+    strncpy(ifr.ifr_name, dev, IFNAMSIZ - 1);
+    if (ioctl(s, SIOCGIFINDEX, &ifr) < 0) goto err;
+    *ifindex = ifr.ifr_ifindex;
+    if (ioctl(s, SIOCGIFADDR, &ifr) < 0) goto err;
+    *ip = ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr;
+    if (ioctl(s, SIOCGIFHWADDR, &ifr) < 0) goto err;
+    memcpy(mac, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
+    close(s);
+    return 0;
+err:
+    close(s);
+    return -1;
 }
 
-// handle signals, such as CTRL-C
-void sig_handler() {
-	m.alive = false;
+int send_arp_request(int sock, int ifindex, struct in_addr my_ip, struct ether_addr my_mac, struct in_addr target_ip) {
+    struct sockaddr_ll sa = {0};
+    sa.sll_family = AF_PACKET;
+    sa.sll_ifindex = ifindex;
+    sa.sll_halen = ETH_ALEN;
+    memset(sa.sll_addr, 0xff, ETH_ALEN);
+    uint8_t buf[ETH_FRAME_LEN] = {0};
+    struct ether_header *eh = (struct ether_header *)buf;
+    memset(eh->ether_dhost, 0xff, ETH_ALEN);
+    memcpy(eh->ether_shost, &my_mac, ETH_ALEN);
+    eh->ether_type = htons(ETH_P_ARP);
+    uint8_t *p = buf + ETH_HLEN;
+    *p++ = 0x00; *p++ = 0x01;  // ar_hrd
+    *p++ = 0x08; *p++ = 0x00;  // ar_pro
+    *p++ = ETH_ALEN;  // ar_hln
+    *p++ = 4;  // ar_pln
+    *p++ = 0x00; *p++ = 0x01;  // ar_op (request)
+    memcpy(p, &my_mac, ETH_ALEN); p += ETH_ALEN;
+    memcpy(p, &my_ip.s_addr, 4); p += 4;
+    memset(p, 0, ETH_ALEN); p += ETH_ALEN;
+    memcpy(p, &target_ip.s_addr, 4); p += 4;
+    int len = p - buf;
+    return sendto(sock, buf, len, 0, (struct sockaddr *)&sa, sizeof(sa));
 }
 
-int initialize() {
-	RETONFAIL(get_local_ip());
-
-	// get gateway ipv4 :)
-	RETONFAIL(get_gateway_ip((unsigned char*)&m.gate_ip, m.eth_dev_s));
-
-	// attach signal handler
-	struct sigaction action;
-	memset(&action, 0, sizeof(action));
-	action.sa_handler = &sig_handler;
-	sigaction(SIGINT, &action, NULL);  // close by CTRL-C
-	sigaction(SIGTERM, &action, NULL); // close by task manager and/or kill
-
-	// set alive flag
-	m.alive = true;
-
-	// allocate memory for storing packets
-	m.buffer = (unsigned char *) malloc(65536);
-
-	// open the socket
-	m.sock_raw = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL)) ;
-
-	// listen on a specific network device
-	setsockopt(m.sock_raw, SOL_SOCKET, SO_BINDTODEVICE, m.eth_dev_s, strlen(m.eth_dev_s)+1);
-
-	if(m.sock_raw < 0) {
-		perror("socket error");
-		return 1;
-	}
-
-	uint32_t eth_ip =     *((uint32_t*)&m.eth_ip);
-	uint32_t gateway_ip = *((uint32_t*)&m.gate_ip);
-
-	// add gateway to blacklist if needed
-	bool allow_gateway = false;
-	if(m.allow_gateway_s) {
-		allow_gateway = the_great_bool_destringifier(m.allow_gateway_s);
-	}
-
-	if(!allow_gateway) {
-		arr_add(m.source_blacklist, gateway_ip);
-	}
-
-	printf("Listen for ARP requests from Source IPs ");
-	print_ip(eth_ip&m.subnet);
-	printf(" - ");
-	print_ip(eth_ip|~m.subnet);
-	if(arr_count(m.source_blacklist) != 0) {
-		printf(" but ignore the following IP(s):");
-
-		for(size_t i = 0; i < arr_count(m.source_blacklist); i++) {
-			printf(" ");
-			print_ip(m.source_blacklist[i]);
-		}
-	}
-	puts("");
-	fflush(stdout); //to see this message in systemctl status
-
-	return 0;
+int is_arp_reply(const uint8_t *buf, int len, struct in_addr target_ip) {
+    if (len < ETH_HLEN + 28) return 0;
+    const struct ether_header *eh = (const struct ether_header *)buf;
+    if (ntohs(eh->ether_type) != ETH_P_ARP) return 0;
+    const uint8_t *p = buf + ETH_HLEN;
+    if (p[6] != 0x00 || p[7] != 0x02) return 0;  // op == reply
+    struct in_addr sender_ip;
+    memcpy(&sender_ip, p + 14, 4);  // sender IP offset
+    return (sender_ip.s_addr == target_ip.s_addr);
 }
 
-int watch_packets() {
-	int saddr_size, data_size;
-	struct sockaddr saddr;
-
-	while(m.alive) {
-		saddr_size = sizeof saddr;
-		// receive a packet
-		data_size = recvfrom(m.sock_raw, m.buffer, 65536, 0, &saddr, (socklen_t*)&saddr_size);
-		if(data_size < 0) {
-			if(!m.alive) {
-				return 0; //don't print errors for stop
-			}
-			perror("recvfrom failed to get packets");
-			return 1;
-		}
-		// now process the packet
-		RETONFAIL(process_packet(m.buffer));
-	}
-	return 0;
+int send_wol(const struct config *conf, int target_idx, struct in_addr lan_ip) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return -1;
+    int opt = 1;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt));
+    struct sockaddr_in myaddr = {0};
+    myaddr.sin_family = AF_INET;
+    myaddr.sin_addr = lan_ip;
+    myaddr.sin_port = 0;
+    if (bind(sock, (struct sockaddr *)&myaddr, sizeof(myaddr)) < 0) goto err;
+    uint8_t payload[102];
+    uint8_t *p = payload;
+    memset(p, 0xff, 6); p += 6;
+    for (int j = 0; j < 16; j++) {
+        memcpy(p, &conf->target_mac[target_idx], ETH_ALEN);
+        p += ETH_ALEN;
+    }
+    struct sockaddr_in dest = {0};
+    dest.sin_family = AF_INET;
+    dest.sin_addr = conf->broadcast_ip;
+    dest.sin_port = htons(9);
+    sendto(sock, payload, p - payload, 0, (struct sockaddr *)&dest, sizeof(dest));
+    close(sock);
+    return 0;
+err:
+    close(sock);
+    return -1;
 }
 
-int process_packet(unsigned char* buffer) {
-	// get the IP Header part of this packet, excluding the ethernet header
-	//struct iphdr *iph = (struct iphdr*)(buffer + sizeof(struct ethhdr));
-
-	// TODO: Research packet types for ARP
-	// Known types are: 157 (from router), 87 and 129
-	//printf("%u\n", iph->protocol);
-
-	// for now, accept all packets
-	RETONFAIL(parse_ethhdr(buffer));
-
-	return 0;
+int main() {
+    struct config conf;
+    if (load_config(&conf) < 0) return 1;
+    struct in_addr my_ip, lan_ip;
+    struct ether_addr my_mac, lan_mac;
+    int ifindex, lan_ifindex;
+    if (get_interface_info(conf.net_device, &my_ip, &my_mac, &ifindex) < 0) {
+        perror("WiFi interface info");
+        return 1;
+    }
+    if (get_interface_info(conf.lan_device, &lan_ip, &lan_mac, &lan_ifindex) < 0) {
+        perror("LAN interface info");
+        return 1;
+    }
+    int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP));
+    if (sock < 0) {
+        perror("ARP socket");
+        return 1;
+    }
+    struct sockaddr_ll bind_sa = {0};
+    bind_sa.sll_family = AF_PACKET;
+    bind_sa.sll_protocol = htons(ETH_P_ARP);
+    bind_sa.sll_ifindex = ifindex;
+    if (bind(sock, (struct sockaddr *)&bind_sa, sizeof(bind_sa)) < 0) {
+        perror("bind ARP socket");
+        close(sock);
+        return 1;
+    }
+    struct timeval tv = {0, REPLY_TIMEOUT_US};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    int states[MAX_TARGETS] = {0};
+    while (1) {
+        for (int i = 0; i < conf.num_targets; i++) {
+            if (send_arp_request(sock, ifindex, my_ip, my_mac, conf.target_ip[i]) < 0) {
+                perror("send ARP request");
+                continue;
+            }
+            int replied = 0;
+            while (1) {
+                uint8_t buf[1024];
+                int n = recv(sock, buf, sizeof(buf), 0);
+                if (n < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    perror("recv ARP");
+                    break;
+                }
+                if (is_arp_reply(buf, n, conf.target_ip[i])) {
+                    replied = 1;
+                }
+            }
+            if (replied) {
+                if (states[i] == 0) {
+                    if (send_wol(&conf, i, lan_ip) < 0) {
+                        perror("send WoL");
+                    }
+                    states[i] = 1;
+                }
+            } else {
+                states[i] = 0;
+            }
+        }
+        sleep(POLL_INTERVAL);
+    }
+    close(sock);
+    return 0;
 }
-
-int parse_arp(unsigned char *data) {
-	ns_arp_packet_hdr_t *arp_hdr = (ns_arp_packet_hdr_t *) data;
-	ns_arp_IPv4_eth_packet_t *arp_IPv4 = NULL;
-
-	if(ntohs(arp_hdr->ns_arp_hw_type) != NS_ARP_ETHERNET_TYPE) {
-		fprintf(stderr, "dis not ethernet :(\n");
-		exit(EXIT_FAILURE);
-	}
-
-	if(ntohs(arp_hdr->ns_arp_proto_type) != NS_ETH_TYPE_IPv4) {
-		fprintf(stderr, "i bet you're using IPv4\n");
-		exit(EXIT_FAILURE);
-	}
-
-	arp_IPv4 = (ns_arp_IPv4_eth_packet_t *) data;
-
-	// sender and target hardware
-	//unsigned char *sh = arp_IPv4->ns_arp_sender_hw_addr;
-	//unsigned char *th = arp_IPv4->ns_arp_sender_hw_addr;
-
-	// ARP type
-	uint16_t type = ntohs(arp_IPv4->ns_arp_hdr.ns_arp_opcode);
-
-	if(type == NS_ARP_REQUEST) {
-		// if source matches to host
-		// and if target matches send magic
-		unsigned int eth_ip = *((unsigned int*)&m.eth_ip);
-
-		// sender and target address
-		unsigned int src_ip, ta_ip;
-		memcpy(&src_ip, arp_IPv4->ns_arp_sender_proto_addr, sizeof(unsigned int));
-		memcpy(&ta_ip, arp_IPv4->ns_arp_target_proto_addr, sizeof(unsigned int));
-
-		if((eth_ip&m.subnet) == (src_ip&m.subnet)) {
-			for(size_t i = 0; i < arr_count(m.target_list); i++) {
-				struct target *link = &m.target_list[i];
-
-				if(*(unsigned int*)link->ip != ta_ip)
-					continue;
-
-				int blacklist_found = -1;
-				arr_find(m.source_blacklist, src_ip, &blacklist_found);
-				if(blacklist_found > -1) {
-					#ifdef DEBUG
-					printf("Blocked '");
-					print_ip(src_ip);
-					puts("' from the blacklist!");
-					#endif
-					break;
-				}
-
-				RETONFAIL(send_magic_packet(link->magic));
-				printf("Magic packet to '");
-				print_ip(ta_ip);
-				printf("' sent by '");
-				print_ip(src_ip);
-				puts("'");
-				fflush(stdout); // Write now to get an accurate timestamp for analyzing wake-up reason
-				break;
-			}
-		}
-	}
-	return 0;
-}
-
-int parse_ethhdr(unsigned char* buffer) {
-	struct ethhdr *eth = (struct ethhdr *)buffer;
-
-	// convert network-endianess to native endianess
-	unsigned short eth_protocol = ntohs(eth->h_proto);
-
-	if(eth_protocol == 0x0806) {
-		unsigned char* arphdr = buffer + sizeof(struct ethhdr);
-		RETONFAIL(parse_arp(arphdr));
-	}
-	return 0;
-}
-
-int read_args(int argc, char *argv[]) {
-	for(int i=1; i<argc; i++) {
-		if(!strcmp(argv[i], "-h")||!strcmp(argv[i], "--help")) {
-			puts(USAGE_INFO);
-			return 0;
-		} else if(!strcmp(argv[i], "-i")) {
-			FAILONARGS(i, argc);
-			target_ip_add(m.target_list, 0, strdup(argv[i+1]));
-			i++;
-		} else if(!strcmp(argv[i], "-m")) {
-			FAILONARGS(i, argc);
-			target_mac_add(m.target_list, 0, strdup(argv[i+1]));
-			i++;
-		} else if(!strcmp(argv[i], "-d")) {
-			FAILONARGS(i, argc);
-			m.eth_dev_s = argv[i+1];
-			i++;
-		} else if(!strcmp(argv[i], "-b")) {
-			FAILONARGS(i, argc);
-			m.broadcast_ip_s = argv[i+1];
-			i++;
-		} else if(!strcmp(argv[i], "-s")) {
-			FAILONARGS(i, argc);
-			m.subnet_s = argv[i+1];
-			i++;
-		} else if(!strcmp(argv[i], "-ag")) {
-			m.allow_gateway_s = "true";
-		}
-	}
-	return 0;
-}
-
-int parse_args() {
-	if(!m.eth_dev_s) {
-		fprintf(stderr, "Ethernet device to record traffic from not specified!\n");
-		return 1;
-	}
-	if(!m.broadcast_ip_s) {
-		fprintf(stderr, "Broadcast IP not specified!\n");
-		return 1;
-	}
-	if(!m.subnet_s) {
-		printf("No search subnet provided. Assuming default host IP must match ARP request.\n");
-		m.subnet = 0xffffffff;
-	}
-
-	// create target macs, ips and magic packets
-	RETONFAIL(targets_configure(m.target_list));
-
-	// subnet mask
-	if(m.subnet_s) {
-		int mask_value;
-		int error = sscanf(m.subnet_s, "%d", &mask_value);
-		if(error != 1 || mask_value < 0 || mask_value > 31) {
-			fprintf(stderr, "Error: Subnet mask must be a value between 0 and 31\n");
-		}
-
-		// calculate proper net mask
-		unsigned int subnet_bigendian = 0xffffffff << (32-mask_value);
-		m.subnet = __builtin_bswap32(subnet_bigendian);
-	}
-
-	return 0;
-}
-
-int send_magic_packet(unsigned char *magic_packet) {
-	int udpSocket = 1;
-	int broadcast = 1;
-	struct sockaddr_in udpClient, udpServer;
-
-	// setup broadcast socket
-	udpSocket = socket(AF_INET, SOCK_DGRAM, 0);
-	if(setsockopt(udpSocket, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast)) == -1) {
-		perror("socket error");
-		return 1;
-	}
-
-	// set parameters
-	udpClient.sin_family = AF_INET;
-	udpClient.sin_addr.s_addr = INADDR_ANY;
-	udpClient.sin_port = 0;
-
-	// bind socket
-	bind(udpSocket, (struct sockaddr*) &udpClient, sizeof(udpClient));
-
-	// set server end point (the broadcast address)
-	udpServer.sin_family = AF_INET;
-	udpServer.sin_addr.s_addr = inet_addr(m.broadcast_ip_s);
-	udpServer.sin_port = htons(9);
-
-	// set server end point
-	sendto(udpSocket, magic_packet, sizeof(unsigned char)*102, 0, (struct sockaddr*) &udpServer, sizeof(udpServer));
-
-	// clean after use
-	close(udpSocket);
-
-	return 0;
-}
-
-int get_local_ip() {
-	int fd;
-	struct ifreq ifr;
-
-	// open socket
-	fd = socket(AF_INET, SOCK_DGRAM, 0);
-
-	if(fd < 0) {
-		perror("socket error");
-		return 1;
-	}
-
-	// get a IPv4 address specifically
-	ifr.ifr_addr.sa_family = AF_INET;
-
-	// get address for the following network device
-	strncpy(ifr.ifr_name, m.eth_dev_s, IFNAMSIZ-1);
-
-	// go fetch
-	int error = ioctl(fd, SIOCGIFADDR, &ifr);
-	if(error == -1) {
-		perror("ioctl error");
-		return 1;
-	}
-
-	// clean up
-	close(fd);
-
-	// get the darn address
-	m.eth_ip_s = inet_ntoa(((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr);
-
-	// convert IP back to binary
-	sscanf(m.eth_ip_s, "%hhu.%hhu.%hhu.%hhu", &m.eth_ip[0],
-						&m.eth_ip[1], &m.eth_ip[2], &m.eth_ip[3]);
-	return 0;
-}
-
-int load_config() {
-	FILE *fp = fopen(CONFIG_PREFIX"/wake-on-arp.conf", "r");
-	if(!fp) {
-		fprintf(stderr, "Could not open config file: "CONFIG_PREFIX"/wake-on-arp.conf\n");
-		return 1;
-	}
-
-	// init variables
-	arr_init(m.source_blacklist);
-	arr_init(m.target_list);
-
-	char *line = NULL;
-	size_t len;
-	while(getline(&line, &len, fp) != -1) {
-		char *name, *val;
-		int error = sscanf(line, "%ms %ms", &name, &val);
-		if(error != 2) continue;
-
-		if(!strcmp("broadcast_ip", name)) {
-			m.broadcast_ip_s = val;
-		} else if(!strcmp("net_device", name)) {
-			m.eth_dev_s = val;
-		} else if(!strcmp("subnet", name)) {
-			m.subnet_s = val;
-		} else if(!strcmp("allow_gateway", name)) {
-			m.allow_gateway_s = val;
-		} else if(!strncmp("target_mac", name, 10)) {
-			unsigned int number = 0;
-			if(!sscanf(name, "target_mac_%u", &number)) {
-				fprintf(stderr, "Invalid option '%s', should be like 'target_mac_1' (fxp)", name);
-				return 2;
-			}
-			target_mac_add(m.target_list, number, val);
-		} else if(!strncmp("target_ip", name, 9)) {
-			unsigned int number = 0;
-			if(!sscanf(name, "target_ip_%u", &number)) {
-				fprintf(stderr, "Invalid option '%s', should be like 'target_ip_1' (fxp)", name);
-				return 2;
-			}
-			target_ip_add(m.target_list, number, val);
-		} else if(!strcmp("source_exclude", name)) {
-			uint8_t address[4];
-			// assuming IPv4
-
-			int err = sscanf(val, "%hhu.%hhu.%hhu.%hhu",
-				&address[0], &address[1], &address[2], &address[3]);
-
-			if(err != 4) {
-				fprintf(stderr, "Invalid IP address specified \"%s\", should be"
-						" in the following format: \"ab.cd.ef.gh\"\n", val);
-				return 2;
-			}
-
-			// add 'em
-			uint32_t address_ptr = *((uint32_t*)&address);
-			arr_add(m.source_blacklist, address_ptr);
-
-			free(val);
-		} else free(val); // not used
-
-		// free unused strings
-		free(name);
-		// WARN: if reload is ever implemented, this is a memory leak
-	}
-	if(line) free(line);
-
-	// weird seg. fault on ARMv7 (have to investigate)
-	//fclose(fp);
-	return 0;
-}
-
-int main(int argc, char *argv[]) {
-	m.allow_gateway_s = NULL; // init config in case it won't be set
-	// priority: load_config < read_args
-	load_config();
-	RETONFAIL(read_args(argc, argv));
-	RETONFAIL(parse_args());
-	RETONFAIL(initialize());
-	RETONFAIL(watch_packets());
-	cleanup();
-	return 0;
-}
-
-
