@@ -4,6 +4,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <net/ethernet.h>
+#include <netinet/ether.h>
 
 int load_config(struct config *conf) {
     memset(conf, 0, sizeof(*conf));
