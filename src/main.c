@@ -133,10 +133,12 @@ int main() {
     int states[MAX_TARGETS] = {0};
     while (1) {
         for (int i = 0; i < conf.num_targets; i++) {
+            printf("Polling target %d: %s (current state: %d)\n", i, inet_ntoa(conf.target_ip[i]), states[i]);
             if (send_arp_request(sock, ifindex, my_ip, my_mac, conf.target_ip[i]) < 0) {
                 perror("send ARP request");
                 continue;
             }
+            printf("Sent ARP request for target %d\n", i);
             int replied = 0;
             while (1) {
                 uint8_t buf[1024];
@@ -148,10 +150,16 @@ int main() {
                 }
                 if (is_arp_reply(buf, n, conf.target_ip[i])) {
                     replied = 1;
+                    printf("Received ARP reply for target %d\n", i);
+                    break;  // Exit the receive loop once reply is confirmed
+                } else {
+                    printf("Received non-matching packet for target %d\n", i);
                 }
             }
+            printf("Poll result for target %d: replied=%d\n", i, replied);
             if (replied) {
                 if (states[i] == 0) {
+                    printf("Trigger detected - sending WoL for target %d\n", i);
                     if (send_wol(&conf, i, lan_ip) < 0) {
                         perror("send WoL");
                     }
@@ -161,6 +169,7 @@ int main() {
                 states[i] = 0;
             }
         }
+        printf("Completed poll cycle - sleeping for %d seconds\n", POLL_INTERVAL);
         sleep(POLL_INTERVAL);
     }
     close(sock);
