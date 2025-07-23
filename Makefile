@@ -4,7 +4,7 @@ obj = $(src:.c=.o)
 PREFIX ?= /usr/local
 CONFIG_PREFIX ?= /etc
 
-CFLAGS = -I./include -DCONFIG_PREFIX="$(CONFIG_PREFIX)"
+CFLAGS = -I./include -DCONFIG_PREFIX=\"$(CONFIG_PREFIX)"
 LDFLAGS = -O2
 
 all: wake-on-arp-alt
