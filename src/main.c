@@ -11,11 +11,12 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/ioctl.h>
-#include <sys/select.h>
+#include <time.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
 #include "config.h"
 
-#define POLL_INTERVAL 5  // seconds between poll cycles
-#define REPLY_TIMEOUT_US 500000  // 0.5 sec for ARP reply
+#define THROTTLE_SEC 30  // Min seconds between WoL sends per target
 
 int get_interface_info(const char *dev, struct in_addr *ip, struct ether_addr *mac, int *ifindex) {
     int s = socket(AF_INET, SOCK_DGRAM, 0);
@@ -33,42 +34,6 @@ int get_interface_info(const char *dev, struct in_addr *ip, struct ether_addr *m
 err:
     close(s);
     return -1;
-}
-
-int send_arp_request(int sock, int ifindex, struct in_addr my_ip, struct ether_addr my_mac, struct in_addr target_ip) {
-    struct sockaddr_ll sa = {0};
-    sa.sll_family = AF_PACKET;
-    sa.sll_ifindex = ifindex;
-    sa.sll_halen = ETH_ALEN;
-    memset(sa.sll_addr, 0xff, ETH_ALEN);
-    uint8_t buf[ETH_FRAME_LEN] = {0};
-    struct ether_header *eh = (struct ether_header *)buf;
-    memset(eh->ether_dhost, 0xff, ETH_ALEN);
-    memcpy(eh->ether_shost, &my_mac, ETH_ALEN);
-    eh->ether_type = htons(ETH_P_ARP);
-    uint8_t *p = buf + ETH_HLEN;
-    *p++ = 0x00; *p++ = 0x01;  // ar_hrd
-    *p++ = 0x08; *p++ = 0x00;  // ar_pro
-    *p++ = ETH_ALEN;  // ar_hln
-    *p++ = 4;  // ar_pln
-    *p++ = 0x00; *p++ = 0x01;  // ar_op (request)
-    memcpy(p, &my_mac, ETH_ALEN); p += ETH_ALEN;
-    memcpy(p, &my_ip.s_addr, 4); p += 4;
-    memset(p, 0, ETH_ALEN); p += ETH_ALEN;
-    memcpy(p, &target_ip.s_addr, 4); p += 4;
-    int len = p - buf;
-    return sendto(sock, buf, len, 0, (struct sockaddr *)&sa, sizeof(sa));
-}
-
-int is_arp_reply(const uint8_t *buf, int len, struct in_addr target_ip) {
-    if (len < ETH_HLEN + 28) return 0;
-    const struct ether_header *eh = (const struct ether_header *)buf;
-    if (ntohs(eh->ether_type) != ETH_P_ARP) return 0;
-    const uint8_t *p = buf + ETH_HLEN;
-    if (p[6] != 0x00 || p[7] != 0x02) return 0;  // op == reply
-    struct in_addr sender_ip;
-    memcpy(&sender_ip, p + 14, 4);  // sender IP offset
-    return (sender_ip.s_addr == target_ip.s_addr);
 }
 
 int send_wol(const struct config *conf, int target_idx, struct in_addr lan_ip) {
@@ -114,63 +79,46 @@ int main() {
         perror("LAN interface info");
         return 1;
     }
-    int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP));
+    int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
     if (sock < 0) {
-        perror("ARP socket");
+        perror("IP socket");
         return 1;
     }
     struct sockaddr_ll bind_sa = {0};
     bind_sa.sll_family = AF_PACKET;
-    bind_sa.sll_protocol = htons(ETH_P_ARP);
+    bind_sa.sll_protocol = htons(ETH_P_IP);
     bind_sa.sll_ifindex = ifindex;
     if (bind(sock, (struct sockaddr *)&bind_sa, sizeof(bind_sa)) < 0) {
-        perror("bind ARP socket");
+        perror("bind IP socket");
         close(sock);
         return 1;
     }
-    struct timeval tv = {0, REPLY_TIMEOUT_US};
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    int states[MAX_TARGETS] = {0};
+    time_t last_send[MAX_TARGETS] = {0};
     while (1) {
-        for (int i = 0; i < conf.num_targets; i++) {
-            printf("Polling target %d: %s (current state: %d)\n", i, inet_ntoa(conf.target_ip[i]), states[i]);
-            if (send_arp_request(sock, ifindex, my_ip, my_mac, conf.target_ip[i]) < 0) {
-                perror("send ARP request");
-                continue;
-            }
-            printf("Sent ARP request for target %d\n", i);
-            int replied = 0;
-            while (1) {
-                uint8_t buf[1024];
-                int n = recv(sock, buf, sizeof(buf), 0);
-                if (n < 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                    perror("recv ARP");
-                    break;
-                }
-                if (is_arp_reply(buf, n, conf.target_ip[i])) {
-                    replied = 1;
-                    printf("Received ARP reply for target %d\n", i);
-                    break;  // Exit the receive loop once reply is confirmed
-                } else {
-                    printf("Received non-matching packet for target %d\n", i);
-                }
-            }
-            printf("Poll result for target %d: replied=%d\n", i, replied);
-            if (replied) {
-                if (states[i] == 0) {
-                    printf("Trigger detected - sending WoL for target %d\n", i);
-                    if (send_wol(&conf, i, lan_ip) < 0) {
-                        perror("send WoL");
+        uint8_t buf[ETH_FRAME_LEN];
+        int len = recv(sock, buf, sizeof(buf), 0);
+        if (len < ETH_HLEN + sizeof(struct iphdr)) continue;
+        struct iphdr *ip = (struct iphdr *)(buf + ETH_HLEN);
+        if (ip->version != 4 || ip->ihl < 5) continue;
+        if (ip->protocol == IPPROTO_TCP) {
+            unsigned int iphlen = ip->ihl * 4;
+            if (len < ETH_HLEN + iphlen + sizeof(struct tcphdr)) continue;
+            struct tcphdr *tcp = (struct tcphdr *)(buf + ETH_HLEN + iphlen);
+            if (tcp->syn) {
+                for (int i = 0; i < conf.num_targets; i++) {
+                    if (ip->saddr == conf.target_ip[i].s_addr &&
+                        ip->daddr == conf.target_server_ip[i].s_addr) {
+                        time_t now = time(NULL);
+                        if (now - last_send[i] > THROTTLE_SEC) {
+                            if (send_wol(&conf, i, lan_ip) < 0) {
+                                perror("send WoL");
+                            }
+                            last_send[i] = now;
+                        }
                     }
-                    states[i] = 1;
                 }
-            } else {
-                states[i] = 0;
             }
         }
-        printf("Completed poll cycle - sleeping for %d seconds\n", POLL_INTERVAL);
-        sleep(POLL_INTERVAL);
     }
     close(sock);
     return 0;
