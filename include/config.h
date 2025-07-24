@@ -18,6 +18,7 @@ struct config {
     bool allow_gateway;
     int num_targets;
     struct in_addr target_ip[MAX_TARGETS];
+    struct in_addr target_server_ip[MAX_TARGETS];
     struct ether_addr target_mac[MAX_TARGETS];
 };
 
