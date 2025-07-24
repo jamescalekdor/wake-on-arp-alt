@@ -4,6 +4,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <net/ethernet.h>
+#include <stdbool.h>
 #include <netinet/ether.h>
 
 int load_config(struct config *conf) {
@@ -37,6 +38,12 @@ int load_config(struct config *conf) {
             int idx = atoi(key + 10) - 1;
             if (idx >= 0 && idx < MAX_TARGETS) {
                 inet_pton(AF_INET, value, &conf->target_ip[idx]);
+                if (idx + 1 > conf->num_targets) conf->num_targets = idx + 1;
+            }
+        } else if (strncmp(key, "target_server_ip_", 17) == 0) {
+            int idx = atoi(key + 17) - 1;
+            if (idx >= 0 && idx < MAX_TARGETS) {
+                inet_pton(AF_INET, value, &conf->target_server_ip[idx]);
                 if (idx + 1 > conf->num_targets) conf->num_targets = idx + 1;
             }
         } else if (strncmp(key, "target_mac_", 11) == 0) {
